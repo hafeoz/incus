@@ -85,6 +85,9 @@ func allowMetrics(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func metricsGet(d *Daemon, r *http.Request) response.Response {
+	requestID := fmt.Sprintf("req-%d", time.Now().UnixNano())
+	logger.Info("DEBUG: metricsGet started", logger.Ctx{"requestID": requestID})
+	
 	s := d.State()
 
 	projectName := request.QueryParam(r, "project")
@@ -93,25 +96,33 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 	// Forward if requested.
 	resp := forwardedResponseIfTargetIsRemote(s, r)
 	if resp != nil {
+		logger.Info("DEBUG: forwarding request", logger.Ctx{"requestID": requestID})
 		return resp
 	}
 
 	// Wait until daemon is fully started.
+	logger.Info("DEBUG: waiting for daemon ready", logger.Ctx{"requestID": requestID})
 	<-d.waitReady.Done()
+	logger.Info("DEBUG: daemon ready completed", logger.Ctx{"requestID": requestID})
 
 	// Prepare response.
 	metricSet := metrics.NewMetricSet(nil)
 
 	var projectNames []string
 
+	logger.Info("DEBUG: starting initial database transaction", logger.Ctx{"requestID": requestID})
 	err := s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		logger.Info("DEBUG: inside initial database transaction", logger.Ctx{"requestID": requestID})
+		
 		// Figure out the projects to retrieve.
 		if projectName != "" {
 			projectNames = []string{projectName}
 		} else {
 			// Get all project names if no specific project requested.
+			logger.Info("DEBUG: getting all projects", logger.Ctx{"requestID": requestID})
 			projects, err := dbCluster.GetProjects(ctx, tx.Tx())
 			if err != nil {
+				logger.Error("DEBUG: failed to get projects", logger.Ctx{"requestID": requestID, "err": err})
 				return fmt.Errorf("Failed loading projects: %w", err)
 			}
 
@@ -119,19 +130,25 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 			for _, project := range projects {
 				projectNames = append(projectNames, project.Name)
 			}
+			logger.Info("DEBUG: got projects", logger.Ctx{"requestID": requestID, "count": len(projectNames)})
 		}
 
 		// Add internal metrics.
+		logger.Info("DEBUG: adding internal metrics", logger.Ctx{"requestID": requestID})
 		metricSet.Merge(internalMetrics(ctx, s.StartTime, tx))
+		logger.Info("DEBUG: internal metrics added", logger.Ctx{"requestID": requestID})
 
 		return nil
 	})
 	if err != nil {
+		logger.Error("DEBUG: initial database transaction failed", logger.Ctx{"requestID": requestID, "err": err})
 		return response.SmartError(err)
 	}
+	logger.Info("DEBUG: initial database transaction completed", logger.Ctx{"requestID": requestID})
 
 	// invalidProjectFilters returns project filters which are either not in cache or have expired.
 	invalidProjectFilters := func(projectNames []string) []dbCluster.InstanceFilter {
+		logger.Info("DEBUG: checking cache validity", logger.Ctx{"requestID": requestID, "projects": len(projectNames)})
 		metricsCacheLock.Lock()
 		defer metricsCacheLock.Unlock()
 
@@ -154,6 +171,7 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 			metricSet.Merge(cache.metrics)
 		}
 
+		logger.Info("DEBUG: cache check completed", logger.Ctx{"requestID": requestID, "invalid": len(filters), "total": len(projectNames)})
 		return filters
 	}
 
@@ -162,53 +180,72 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 
 	// If all valid, return immediately.
 	if len(projectsToFetch) == 0 {
+		logger.Info("DEBUG: all metrics cached, returning immediately", logger.Ctx{"requestID": requestID})
 		return getFilteredMetrics(s, r, compress, metricSet)
 	}
 
 	cacheDuration := time.Duration(8) * time.Second
 
 	// Acquire update lock.
+	logger.Info("DEBUG: attempting to acquire metricsGet lock", logger.Ctx{"requestID": requestID, "timeout": cacheDuration.String()})
 	lockCtx, lockCtxCancel := context.WithTimeout(r.Context(), cacheDuration)
 	defer lockCtxCancel()
 
 	unlock, err := locking.Lock(lockCtx, "metricsGet")
 	if err != nil {
+		logger.Error("DEBUG: failed to acquire metricsGet lock", logger.Ctx{"requestID": requestID, "err": err})
 		return response.SmartError(api.StatusErrorf(http.StatusLocked, "Metrics are currently being built by another request: %s", err))
 	}
+	logger.Info("DEBUG: successfully acquired metricsGet lock", logger.Ctx{"requestID": requestID})
 
-	defer unlock()
+	defer func() {
+		logger.Info("DEBUG: releasing metricsGet lock", logger.Ctx{"requestID": requestID})
+		unlock()
+		logger.Info("DEBUG: metricsGet lock released", logger.Ctx{"requestID": requestID})
+	}()
 
 	// Setup a new response.
 	metricSet = metrics.NewMetricSet(nil)
 
 	// Check if any of the missing data has been filled in since acquiring the lock.
 	// As its possible another request was already populating the cache when we tried to take the lock.
+	logger.Info("DEBUG: re-checking cache after acquiring lock", logger.Ctx{"requestID": requestID})
 	projectsToFetch = invalidProjectFilters(projectNames)
 
 	// If all valid, return immediately.
 	if len(projectsToFetch) == 0 {
+		logger.Info("DEBUG: all metrics now cached after lock acquisition, returning", logger.Ctx{"requestID": requestID})
 		return getFilteredMetrics(s, r, compress, metricSet)
 	}
 
 	// Gather information about host interfaces once.
+	logger.Info("DEBUG: gathering host interfaces", logger.Ctx{"requestID": requestID})
 	hostInterfaces, _ := net.Interfaces()
+	logger.Info("DEBUG: host interfaces gathered", logger.Ctx{"requestID": requestID, "count": len(hostInterfaces)})
 
 	var instances []instance.Instance
+	logger.Info("DEBUG: starting instance list transaction", logger.Ctx{"requestID": requestID, "projectsToFetch": len(projectsToFetch)})
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
+		logger.Info("DEBUG: inside instance list transaction", logger.Ctx{"requestID": requestID})
 		return tx.InstanceList(ctx, func(dbInst db.InstanceArgs, p api.Project) error {
+			logger.Info("DEBUG: loading instance", logger.Ctx{"requestID": requestID, "instance": dbInst.Name, "project": dbInst.Project})
 			inst, err := instance.Load(s, dbInst, p)
 			if err != nil {
+				logger.Error("DEBUG: failed to load instance", logger.Ctx{"requestID": requestID, "instance": dbInst.Name, "project": dbInst.Project, "err": err})
 				return fmt.Errorf("Failed loading instance %q in project %q: %w", dbInst.Name, dbInst.Project, err)
 			}
 
 			instances = append(instances, inst)
+			logger.Info("DEBUG: instance loaded successfully", logger.Ctx{"requestID": requestID, "instance": dbInst.Name, "project": dbInst.Project})
 
 			return nil
 		}, projectsToFetch...)
 	})
 	if err != nil {
+		logger.Error("DEBUG: instance list transaction failed", logger.Ctx{"requestID": requestID, "err": err})
 		return response.SmartError(err)
 	}
+	logger.Info("DEBUG: instance list transaction completed", logger.Ctx{"requestID": requestID, "instanceCount": len(instances)})
 
 	// Prepare temporary metrics storage.
 	newMetrics := make(map[string]*metrics.MetricSet, len(projectsToFetch))
@@ -223,19 +260,26 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 		maxConcurrent = instCount
 	}
 
+	logger.Info("DEBUG: starting metrics collection", logger.Ctx{"requestID": requestID, "instanceCount": instCount, "maxConcurrent": maxConcurrent})
+
 	// Start metrics builder routines.
-	for range maxConcurrent {
-		go func(instMetricsCh <-chan instance.Instance) {
+	for i := range maxConcurrent {
+		go func(workerID int, instMetricsCh <-chan instance.Instance) {
+			logger.Info("DEBUG: metrics worker started", logger.Ctx{"requestID": requestID, "workerID": workerID})
 			for inst := range instMetricsCh {
+				logger.Info("DEBUG: processing instance metrics", logger.Ctx{"requestID": requestID, "workerID": workerID, "instance": inst.Name(), "project": inst.Project().Name})
 				projectName := inst.Project().Name
 				instanceMetrics, err := inst.Metrics(hostInterfaces)
 				if err != nil {
 					// Ignore stopped instances.
 					if !errors.Is(err, instanceDrivers.ErrInstanceIsStopped) {
-						logger.Warn("Failed getting instance metrics", logger.Ctx{"instance": inst.Name(), "project": projectName, "err": err})
+						logger.Warn("Failed getting instance metrics", logger.Ctx{"requestID": requestID, "workerID": workerID, "instance": inst.Name(), "project": projectName, "err": err})
+					} else {
+						logger.Info("DEBUG: instance stopped, skipping metrics", logger.Ctx{"requestID": requestID, "workerID": workerID, "instance": inst.Name(), "project": projectName})
 					}
 				} else {
 					// Add the metrics.
+					logger.Info("DEBUG: adding instance metrics to cache", logger.Ctx{"requestID": requestID, "workerID": workerID, "instance": inst.Name(), "project": projectName})
 					newMetricsLock.Lock()
 
 					// Initialize metrics set for project if needed.
@@ -246,23 +290,34 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 					newMetrics[projectName].Merge(instanceMetrics)
 
 					newMetricsLock.Unlock()
+					logger.Info("DEBUG: instance metrics added successfully", logger.Ctx{"requestID": requestID, "workerID": workerID, "instance": inst.Name(), "project": projectName})
 				}
 
+				logger.Info("DEBUG: instance processing completed", logger.Ctx{"requestID": requestID, "workerID": workerID, "instance": inst.Name(), "project": inst.Project().Name})
 				wg.Done()
 			}
-		}(instMetricsCh)
+			logger.Info("DEBUG: metrics worker finished", logger.Ctx{"requestID": requestID, "workerID": workerID})
+		}(i, instMetricsCh)
 	}
 
 	// Fetch what's missing.
+	logger.Info("DEBUG: queuing instances for metrics collection", logger.Ctx{"requestID": requestID, "instanceCount": len(instances)})
 	for _, inst := range instances {
+		logger.Info("DEBUG: queuing instance", logger.Ctx{"requestID": requestID, "instance": inst.Name(), "project": inst.Project().Name})
 		wg.Add(1)
 		instMetricsCh <- inst
 	}
+	logger.Info("DEBUG: all instances queued", logger.Ctx{"requestID": requestID})
 
+	logger.Info("DEBUG: waiting for all workers to complete", logger.Ctx{"requestID": requestID})
 	wg.Wait()
+	logger.Info("DEBUG: all workers completed", logger.Ctx{"requestID": requestID})
+	
 	close(instMetricsCh)
+	logger.Info("DEBUG: metrics channel closed", logger.Ctx{"requestID": requestID})
 
 	// Put the new data in the global cache and in response.
+	logger.Info("DEBUG: updating global cache", logger.Ctx{"requestID": requestID})
 	metricsCacheLock.Lock()
 
 	if metricsCache == nil {
@@ -271,6 +326,7 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 
 	updatedProjects := []string{}
 	for project, entries := range newMetrics {
+		logger.Info("DEBUG: caching project metrics", logger.Ctx{"requestID": requestID, "project": project})
 		metricsCache[project] = metricsCacheEntry{
 			expiry:  time.Now().Add(cacheDuration),
 			metrics: entries,
@@ -285,13 +341,16 @@ func metricsGet(d *Daemon, r *http.Request) response.Response {
 			continue
 		}
 
+		logger.Info("DEBUG: caching empty project metrics", logger.Ctx{"requestID": requestID, "project": *project.Project})
 		metricsCache[*project.Project] = metricsCacheEntry{
 			expiry: time.Now().Add(cacheDuration),
 		}
 	}
 
 	metricsCacheLock.Unlock()
+	logger.Info("DEBUG: global cache updated", logger.Ctx{"requestID": requestID})
 
+	logger.Info("DEBUG: metricsGet completed successfully", logger.Ctx{"requestID": requestID})
 	return getFilteredMetrics(s, r, compress, metricSet)
 }
 
